@@ -2,46 +2,6 @@ name: CI
 
 on:
   workflow_dispatch: # allows manual triggering
-  push:
-    branches:
-      - master
-    paths: [
-      '.github/workflows/build.yml',
-      '.github/workflows/build-linux-cross.yml',
-      '.github/workflows/build-cmake-pkg.yml',
-      '**/CMakeLists.txt',
-      '**/.cmake',
-      '**/*.h',
-      '**/*.hpp',
-      '**/*.c',
-      '**/*.cpp',
-      '**/*.cu',
-      '**/*.cuh',
-      '**/*.swift',
-      '**/*.m',
-      '**/*.metal',
-      '**/*.comp'
-    ]
-
-  pull_request:
-    types: [opened, synchronize, reopened]
-    paths: [
-      '.github/workflows/build.yml',
-      '.github/workflows/build-linux-cross.yml',
-      '.github/workflows/build-cmake-pkg.yml',
-      '**/CMakeLists.txt',
-      '**/.cmake',
-      '**/*.h',
-      '**/*.hpp',
-      '**/*.c',
-      '**/*.cpp',
-      '**/*.cu',
-      '**/*.cuh',
-      '**/*.swift',
-      '**/*.m',
-      '**/*.metal',
-      '**/*.comp'
-    ]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
@@ -882,7 +842,7 @@ jobs:
 
     strategy:
       matrix:
-        cuda: ['12.4']
+        cuda: ['12.8', '12.9']
 
     steps:
       - name: Clone
@@ -928,6 +888,12 @@ jobs:
           set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
           cmake --build build --config Release -j %NINJA_JOBS% -t ggml
           cmake --build build --config Release
+
+      - name: Upload Windows CUDA Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: llama-build-windows-cuda-${{ matrix.cuda }}
+          path: build/bin/Release/*
 
   windows-latest-cmake-sycl:
     runs-on: windows-2022
