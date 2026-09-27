@@ -1,0 +1,264 @@
+name: Release (Windows Vulkan)
+
+# 独立于主 release.yml 的 Windows + Vulkan 专属编译/打包/发布流水线。
+# 不依赖 macOS / Linux / CUDA / ROCm / Android / ui-build 等其它平台的 job，
+# 可以单独触发、单独排队、单独发布，不会被主 release 工作流的队列阻塞。
+#
+# 编译参数来自 build-vulkan.yml 的 `windows` job（Vulkan SDK 安装、
+# x64-windows-llvm 工具链、GGML_BACKEND_DL + GGML_CPU_ALL_VARIANTS 组合），
+# 因此产物是一个功能完整、自包含的 llama-server / llama-cli 包（内置多套 CPU
+# 变体 + Vulkan 后端 DLL），不需要像 release.yml 里 `windows` matrix job 那样
+# 后续再和 windows-cpu 的产物合并。
+#
+# 打包/发布流程（tag 计算、创建 GitHub Release、上传 asset）沿用 release.yml
+# 的既有模式，复用仓库里已有的 ./.github/actions/get-tag-name、
+# ./.github/actions/ccache-clear 以及 ggml-org/action-create-release。
+
+on:
+  workflow_dispatch: # allows manual triggering
+    inputs:
+      create_release:
+        description: 'Create new release'
+        required: true
+        type: boolean
+  push:
+    branches:
+      - master
+      - qwen4exp-mtp
+    paths: [
+      '.github/workflows/release-windows-vulkan.yml',
+      '**/CMakeLists.txt',
+      '**/.cmake',
+      '**/*.h',
+      '**/*.hpp',
+      '**/*.c',
+      '**/*.cpp',
+      '**/*.comp',
+      '**/*.glsl'
+    ]
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  CMAKE_ARGS: "-DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DGGML_RPC=ON"
+
+# 单独的 concurrency group，避免和主 release.yml（group: release）互相排队等待
+concurrency:
+  group: release-windows-vulkan
+  queue: max
+
+jobs:
+  check-release:
+    runs-on: ubuntu-slim
+
+    outputs:
+      should_release: ${{ steps.check.outputs.should_release }}
+
+    steps:
+      - id: check
+        env:
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "should_release=true" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" == "refs/heads/master" ]]; then
+            if echo "$COMMIT_MESSAGE" | grep -q '\[no release\]'; then
+              echo "should_release=false" >> $GITHUB_OUTPUT
+            else
+              echo "should_release=true" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "should_release=false" >> $GITHUB_OUTPUT
+          fi
+
+  windows-vulkan:
+    name: windows-vulkan / x64
+    needs: [check-release]
+    if: ${{ needs.check-release.outputs.should_release == 'true' }}
+
+    runs-on: windows-2025
+
+    permissions:
+      actions: write
+
+    env:
+      VULKAN_VERSION: 1.4.357.0
+
+    steps:
+      - name: Clone
+        id: checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.24
+        with:
+          key: release-windows-vulkan-x64
+          variant: ccache
+          evict-old-files: 1d
+          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+
+      # 与 build-vulkan.yml 的 windows job 完全一致的 Vulkan SDK 安装方式
+      - name: Install Vulkan SDK
+        id: get_vulkan
+        run: |
+          curl.exe -o $env:RUNNER_TEMP/VulkanSDK-Installer.exe -L "https://sdk.lunarg.com/sdk/download/${env:VULKAN_VERSION}/windows/vulkansdk-windows-X64-${env:VULKAN_VERSION}.exe"
+          & "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" --accept-licenses --default-answer --confirm-command install
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\${env:VULKAN_VERSION}"
+          Add-Content $env:GITHUB_PATH "C:\VulkanSDK\${env:VULKAN_VERSION}\bin"
+
+      - name: Install Ninja
+        id: install_ninja
+        run: |
+          choco install ninja
+
+      # 提示：如需要在 llama-server 中内置 Web UI，可以像 release.yml 的
+      # windows-cpu job 一样，先调用可复用的 ./.github/workflows/ui-build.yml
+      # 生成 llama-ui.zip，再用 actions/download-artifact 下载到
+      # tools/ui/dist，然后再执行下面的 Build 步骤。这里为了保持本
+      # workflow 的独立性（不依赖其它 job），默认不包含该步骤。
+
+      # 编译参数取自 build-vulkan.yml 的 windows job：
+      # GGML_BACKEND_DL + GGML_CPU_ALL_VARIANTS 让产物自带多套 CPU 后端，
+      # 叠加 GGML_VULKAN 后即可得到一个无需再合并其它 zip 的完整发布包。
+      - name: Build
+        id: cmake_build
+        run: |
+          cmake -S . -B build -G "Ninja Multi-Config" `
+            -D CMAKE_TOOLCHAIN_FILE=cmake/x64-windows-llvm.cmake `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DGGML_NATIVE=OFF `
+            -DGGML_BACKEND_DL=ON `
+            -DGGML_CPU_ALL_VARIANTS=ON `
+            -DGGML_VULKAN=ON `
+            -DLLAMA_BUILD_BORINGSSL=ON `
+            ${{ env.CMAKE_ARGS }}
+          cmake --build build --config Release -j ${env:NUMBER_OF_PROCESSORS}
+
+      - name: Determine tag name
+        id: tag
+        uses: ./.github/actions/get-tag-name
+
+      - name: Pack artifacts
+        id: pack_artifacts
+        run: |
+          Copy-Item LICENSE .\build\bin\Release\
+          7z a -snl llama-${{ steps.tag.outputs.name }}-bin-win-vulkan-x64.zip .\build\bin\Release\*
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          path: llama-${{ steps.tag.outputs.name }}-bin-win-vulkan-x64.zip
+          name: llama-bin-win-vulkan-x64.zip
+
+      - name: ccache-clear
+        uses: ./.github/actions/ccache-clear
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          key: release-windows-vulkan-x64
+          older: 5m
+          min: 1
+          dry-run: ${{ github.event_name != 'push' || github.ref != 'refs/heads/master' }}
+
+  release:
+    if: ${{ ( github.event_name == 'push' && github.ref == 'refs/heads/master' ) || github.event.inputs.create_release == 'true' }}
+
+    # Fine-grant permission
+    # https://docs.github.com/en/actions/security-for-github-actions/security-guides/automatic-token-authentication#modifying-the-permissions-for-the-github_token
+    permissions:
+      contents: write # for creating release
+      id-token: write
+      attestations: write
+
+    runs-on: ubuntu-slim
+
+    needs:
+      - windows-vulkan
+
+    outputs:
+      tag_name: ${{ steps.tag.outputs.name }}
+
+    steps:
+      - name: Clone
+        id: checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ssh-key: ${{ secrets.DEPLOY_KEY_RELEASE }}
+
+      - name: Determine tag name
+        id: tag
+        uses: ./.github/actions/get-tag-name
+
+      - name: Download artifacts
+        id: download-artifact
+        uses: actions/download-artifact@v7
+        with:
+          path: ./artifact
+          merge-multiple: true
+
+      - name: Move artifacts
+        id: move_artifacts
+        run: |
+          mkdir -p release
+          mv -v artifact/*.zip release
+
+      - name: Attest release artifacts
+        id: attest
+        uses: actions/attest@v4
+        with:
+          subject-path: 'release/*'
+
+      - name: Create and push git tag
+        run: |
+          TAG="${{ steps.tag.outputs.name }}"
+          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "Tag ${TAG} already exists, skipping creation"
+          else
+            git tag "${TAG}"
+            git push origin "${TAG}"
+          fi
+
+      - name: Create release
+        id: create_release
+        uses: ggml-org/action-create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ steps.tag.outputs.name }}
+          prerelease: true
+          body: |
+            <details open>
+
+            ${{ github.event.head_commit.message }}
+
+            </details>
+
+            **Attestations:**
+            - <${{ steps.attest.outputs.attestation-url }}>
+
+            **Windows:**
+            - [Windows x64 (Vulkan)](https://github.com/${{ github.repository }}/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-win-vulkan-x64.zip)
+
+      - name: Upload release
+        id: upload_release
+        uses: actions/github-script@v8
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const path = require('path');
+            const fs = require('fs');
+            const release_id = '${{ steps.create_release.outputs.id }}';
+            for (let file of await fs.readdirSync('./release')) {
+              if (path.extname(file) === '.zip') {
+                console.log('uploadReleaseAsset', file);
+                await github.rest.repos.uploadReleaseAsset({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  release_id: release_id,
+                  name: file,
+                  data: await fs.readFileSync(`./release/${file}`)
+                });
+              }
+            }
