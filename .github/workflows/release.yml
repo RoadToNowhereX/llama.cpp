@@ -10,6 +10,7 @@ on:
   push:
     branches:
       - master
+      - qwen4exp-mtp
     paths: [
       '.github/workflows/release.yml',
       '**/CMakeLists.txt',
