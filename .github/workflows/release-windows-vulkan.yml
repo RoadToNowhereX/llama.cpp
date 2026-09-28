@@ -39,6 +39,7 @@ on:
 
 env:
   GH_TOKEN: ${{ github.token }}
+  BRANCH_NAME: ${{ github.head_ref || github.ref_name }}
   CMAKE_ARGS: "-DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DGGML_RPC=ON"
 
 # 单独的 concurrency group，避免和主 release.yml（group: release）互相排队等待
